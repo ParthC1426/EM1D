@@ -58,15 +58,81 @@ TRUST_CAPTION = {
     "UNRELIABLE": "Do not trust — verify in full-wave simulation.",
 }
 
-# Hard-coded CST-verified champion values (the reference truth for comparison).
-CHAMPION_VERIFIED = {
-    "s11_at_2p45":  ("S11 at 2.45 GHz",     "-26.4 dB"),
-    "s11_min_freq": ("Resonant frequency",  "2.452 GHz"),
-    "max_gain_dbi": ("Peak directivity",    "11.03 dBi"),
-    "total_efficiency_db": ("Total efficiency", "~99%"),
-    "vswr":         ("VSWR",                "1.16"),
-    "bw":           ("-10 dB bandwidth",    "36 MHz (2.434-2.470 GHz)"),
+# Predicted-vs-verified comparison rows.
+#   surrogate: a model key (live value from predict_all), "broadside" (a modelling
+#              assumption), or None (metric the surrogate does not model -> "—").
+#   verified : the CST-measured truth — the ONLY hard-coded value in each row.
+# Only the "CST-verified" column is hard-coded; modelled cells are computed live.
+COMPARISON_ROWS = [
+    ("S11 at 2.45 GHz",      "s11_at_2p45",         "−26.4 dB",                 "UNRELIABLE"),
+    ("Resonant frequency",   "s11_min_freq",        "2.452 GHz",                "UNRELIABLE"),
+    ("Peak directivity",     "max_gain_dbi",        "10.9 dBi",                 "RELIABLE"),
+    ("Total efficiency",     "total_efficiency_db", "≈100% (−0.002 dB)",        "MARGINAL"),
+    ("Radiation efficiency", None,                  "≈96% (0.17 dB)",           "—"),
+    ("Main-lobe direction",  "broadside",           "31° from boresight",       "—"),
+    ("3-dB beamwidth",       None,                  "39.6°",                    "—"),
+    ("Side-lobe level",      None,                  "−21.8 dB",                 "—"),
+    ("VSWR",                 None,                  "1.16",                     "—"),
+    ("−10 dB bandwidth",     None,                  "36 MHz (2.434–2.470 GHz)", "—"),
+]
+
+# Per-metric formatting of the live surrogate value for the comparison table.
+SURR_FMT = {
+    "s11_at_2p45":         lambda m: f"{m:.1f} dB",
+    "s11_min_freq":        lambda m: f"{m:.3f} GHz",
+    "max_gain_dbi":        lambda m: f"{m:.2f} dBi",
+    "total_efficiency_db": lambda m: f"{m:.2f} dB",
 }
+
+# Centralised styling. Card colours/borders/radii/typography live here as CSS
+# classes instead of long inline strings scattered through the st.markdown calls.
+APP_CSS = f"""
+<style>
+  /* Constrain & centre the main content so it doesn't sprawl on wide monitors. */
+  .block-container, .stMainBlockContainer {{
+      max-width: 1100px;
+      margin: 0 auto;
+      padding-top: 2.2rem;
+  }}
+
+  /* Typography hierarchy. */
+  h1 {{ font-size: 2.0rem; font-weight: 700; letter-spacing: -0.01em; }}
+  h2 {{ font-size: 1.35rem; font-weight: 700; }}
+  h3 {{ font-size: 1.15rem; font-weight: 700; }}
+  h4 {{ font-size: 1.0rem;  font-weight: 700; color: #334155; }}
+  /* Higher-contrast captions than Streamlit's default light grey. */
+  div[data-testid="stCaptionContainer"] p {{ color: #4a5568 !important; }}
+
+  /* Metric cards — equal height, title -> value -> badge stacked vertically. */
+  .metric-card {{
+      border: 1px solid #e2e5ea;
+      border-left: 6px solid #888;
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 8px;
+      min-height: 148px;
+      background: #ffffff;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+  }}
+  .metric-label {{
+      font-size: 0.85rem; font-weight: 600; color: #5a6270;
+      letter-spacing: 0.01em;
+  }}
+  .metric-value {{ font-weight: 700; line-height: 1.15; }}
+  /* number + unit never split, and long values scale down instead of wrapping. */
+  .metric-value .num {{ white-space: nowrap; font-size: clamp(1.05rem, 2.3vw, 1.5rem); }}
+  .metric-value.unreliable {{ color: #9aa0a6; font-weight: 600; }}
+  .metric-value.unreliable .num {{ font-size: clamp(0.95rem, 2.1vw, 1.3rem); }}
+  .metric-value .qualifier {{ font-size: 0.7rem; font-weight: 600; white-space: nowrap; }}
+  .trust-badge {{
+      display: inline-block; align-self: flex-start; margin-top: auto;
+      color: #fff; border-radius: 5px; padding: 2px 9px;
+      font-size: 0.72rem; font-weight: 700; letter-spacing: 0.02em;
+  }}
+</style>
+"""
 
 DATA_PKL = "surrogate_models.pkl"
 DATA_CSV = "training_data.csv"
@@ -129,7 +195,7 @@ def draw_geometry(params):
     L, W = params["L"], params["W"]
     Sx, Sy = params["Sx"], params["Sy"]
 
-    fig, ax = plt.subplots(figsize=(4.6, 4.6))
+    fig, ax = plt.subplots(figsize=(5.0, 5.0), dpi=120)
 
     # Ground plane outline: enclose the array + one patch margin on each side.
     margin_x = W * 0.9
@@ -178,7 +244,7 @@ def draw_geometry(params):
     ax.set_ylim(-gnd_h / 2 * 1.08, gnd_h / 2 * 1.08)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_title("2x2 patch array layout (schematic, proportional)", fontsize=9)
+    ax.set_title("2x2 patch array layout (schematic, proportional)", fontsize=10)
     fig.tight_layout()
     return fig
 
@@ -207,14 +273,15 @@ def draw_uncertainty(preds):
     stds = np.where(np.isfinite(stds), stds, 0.0)
 
     y = np.arange(len(keys))
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(8.4, 3.6))
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.2, 3.6), dpi=120)
 
     # ---- Left: absolute value +/- 1 sigma (native units per metric) ----
     axL.errorbar(means, y, xerr=stds, fmt="none", capsize=6, capthick=2,
                  elinewidth=2.5, ecolor="#888", zorder=2)
     axL.scatter(means, y, c=colors, s=95, zorder=3, edgecolor="#222", linewidth=0.6)
     axL.set_yticks(y)
-    axL.set_yticklabels([f"{s}\n({u})" for s, u in zip(short, units)], fontsize=8)
+    axL.set_yticklabels([f"{s}\n({u})" for s, u in zip(short, units)], fontsize=8.5)
+    axL.tick_params(axis="x", labelsize=8.5)
     axL.invert_yaxis()
 
     lo = float(np.min(means - stds))
@@ -229,9 +296,9 @@ def draw_uncertainty(preds):
     # sigma annotation below each marker so it never sits on the point/labels.
     for yi, m, s, c in zip(y, means, stds, colors):
         axL.annotate(f"±{s:.3g}", (m, yi), textcoords="offset points",
-                     xytext=(0, -13), ha="center", va="top", fontsize=7.5, color=c)
-    axL.set_xlabel("Predicted value (native units)")
-    axL.set_title("Absolute prediction  ± 1σ", fontsize=9)
+                     xytext=(0, -13), ha="center", va="top", fontsize=8, color=c)
+    axL.set_xlabel("Predicted value (native units)", fontsize=9.5)
+    axL.set_title("Absolute prediction  ± 1σ", fontsize=10)
     axL.grid(axis="x", alpha=0.3)
 
     # ---- Right: relative uncertainty sigma / |value| (log scale) ----
@@ -251,9 +318,10 @@ def draw_uncertainty(preds):
     for yi, r, rp in zip(y, rel, rel_plot):
         txt = "n/a" if not np.isfinite(r) else f"{r * 100:.2g}%"
         axR.annotate(txt, (rp, yi), textcoords="offset points", xytext=(4, 0),
-                     ha="left", va="center", fontsize=7.5, color="#333")
-    axR.set_xlabel("Relative uncertainty  σ / |value|  (log)")
-    axR.set_title("Relative uncertainty (σ / |value|)", fontsize=9)
+                     ha="left", va="center", fontsize=8, color="#333")
+    axR.tick_params(axis="x", labelsize=8.5)
+    axR.set_xlabel("Relative uncertainty  σ / |value|  (log)", fontsize=9.5)
+    axR.set_title("Relative uncertainty (σ / |value|)", fontsize=10)
     axR.grid(axis="x", alpha=0.3, which="both")
 
     fig.tight_layout()
@@ -266,6 +334,7 @@ def draw_uncertainty(preds):
 def main():
     st.set_page_config(page_title="Antenna Surrogate Interface",
                        layout="wide", page_icon="📡")
+    st.markdown(APP_CSS, unsafe_allow_html=True)
 
     # Guard: required data files.
     import os
@@ -382,25 +451,21 @@ _Model source: {source}._
                 if trust == "UNRELIABLE":
                     # De-emphasise: a hurried reader must not take this at face value.
                     value_html = (
-                        f'<div style="font-size:1.3rem;font-weight:600;color:#9aa0a6;">'
-                        f'≈ {mean:.2f} ± {std:.2g} {unit}'
-                        f'<span style="font-size:0.7rem;font-weight:600;"> (unverified)'
-                        f'</span></div>')
+                        '<div class="metric-value unreliable">'
+                        f'<span class="num">≈ {mean:.2f} ± {std:.2g} {unit}</span>'
+                        '<span class="qualifier"> (unverified)</span></div>')
                 else:
                     value_html = (
-                        f'<div style="font-size:1.5rem;font-weight:700;">'
-                        f'{mean:.2f} ± {std:.2g} {unit}</div>')
+                        '<div class="metric-value">'
+                        f'<span class="num">{mean:.2f} ± {std:.2g} {unit}</span></div>')
                 st.markdown(
-                    f"""
-<div style="border:1px solid #ddd;border-left:6px solid {color};
-     border-radius:8px;padding:12px 14px;margin-bottom:6px;">
-  <div style="font-size:0.85rem;color:#666;">{label}</div>
-  {value_html}
-  <div style="display:inline-block;background:{color};color:white;
-       border-radius:4px;padding:1px 8px;font-size:0.75rem;font-weight:600;">
-       {trust} · R²={r2:+.2f}</div>
-</div>
-""", unsafe_allow_html=True)
+                    f'<div class="metric-card" style="border-left-color:{color};">'
+                    f'<div class="metric-label">{label}</div>'
+                    f'{value_html}'
+                    f'<div class="trust-badge" style="background:{color};">'
+                    f'{trust} · R²={r2:+.2f}</div>'
+                    '</div>',
+                    unsafe_allow_html=True)
 
                 if key == "s11_at_2p45":
                     passes = mean <= -10.0
@@ -422,7 +487,7 @@ _Model source: {source}._
     st.markdown("#### Uncertainty across metrics")
     try:
         ufig = draw_uncertainty(preds)
-        st.pyplot(ufig)
+        st.pyplot(ufig, use_container_width=True)
         plt.close(ufig)          # avoid stale figure/state reuse across reruns
         st.caption(
             "Left: each metric's predicted value with its ±1σ band, in native units. "
@@ -433,57 +498,50 @@ _Model source: {source}._
         st.warning("Uncertainty chart could not be drawn for these inputs.")
 
     st.markdown("#### Live geometry sketch")
-    try:
-        gfig = draw_geometry(params)
-        st.pyplot(gfig)
-        plt.close(gfig)
-        st.caption(
-            "Schematic 2×2 patch array (proportional): four W×L patches on an "
-            "Sx-by-Sy grid inside the ground-plane outline, feed points marked. "
-            "Updates live with the sliders.")
-    except Exception:
-        logging.exception("Geometry sketch generation failed")
-        st.warning("Geometry sketch could not be drawn for these inputs.")
+    # Constrain the square sketch to part of the width so it doesn't sprawl.
+    gcol, _gspacer = st.columns([3, 2])
+    with gcol:
+        try:
+            gfig = draw_geometry(params)
+            st.pyplot(gfig, use_container_width=True)
+            plt.close(gfig)
+            st.caption(
+                "Schematic 2×2 patch array (proportional): four W×L patches on an "
+                "Sx-by-Sy grid inside the ground-plane outline, feed points marked. "
+                "Updates live with the sliders.")
+        except Exception:
+            logging.exception("Geometry sketch generation failed")
+            st.warning("Geometry sketch could not be drawn for these inputs.")
 
     # ------------------ Predicted vs. Verified Champion table ---------------
     st.markdown("---")
     st.subheader("Predicted vs. Verified Champion")
-    st.caption("Model prediction at the champion geometry vs. the CST-verified truth. "
-               "Some verified quantities (VSWR, bandwidth) are not predicted by the "
-               "surrogate and are shown for reference only.")
+    st.caption("Live surrogate prediction at the champion geometry vs. the "
+               "CST-verified truth. Pattern and matching quantities the surrogate does "
+               "not model (radiation efficiency, beamwidth, side-lobe level, VSWR, "
+               "bandwidth) are shown as “—” for reference only.")
 
     champ_params = {k: PARAM_SPEC[k][4] for k in PARAM_COLS}
     champ_preds = predict_all(models, scaler, champ_params)
 
-    def fmt_pred(key):
-        m, s = champ_preds[key]
-        unit = TRUST[key][1]
-        return f"{m:.2f} ± {s:.2g} {unit}"
+    def surr_cell(spec):
+        """Surrogate column: live model value, a modelling assumption, or '—'."""
+        if spec is None:
+            return "—"
+        if spec == "broadside":
+            return "assumes broadside"
+        mean, _std = champ_preds[spec]
+        # Use a Unicode minus so signs line up with the CST-verified column.
+        return SURR_FMT[spec](mean).replace("-", "−")
 
     table = pd.DataFrame([
-        {"Metric": CHAMPION_VERIFIED["s11_at_2p45"][0],
-         "Surrogate prediction": fmt_pred("s11_at_2p45"),
-         "CST-verified": CHAMPION_VERIFIED["s11_at_2p45"][1],
-         "Trust": TRUST["s11_at_2p45"][3]},
-        {"Metric": CHAMPION_VERIFIED["s11_min_freq"][0],
-         "Surrogate prediction": fmt_pred("s11_min_freq"),
-         "CST-verified": CHAMPION_VERIFIED["s11_min_freq"][1],
-         "Trust": TRUST["s11_min_freq"][3]},
-        {"Metric": CHAMPION_VERIFIED["max_gain_dbi"][0],
-         "Surrogate prediction": fmt_pred("max_gain_dbi"),
-         "CST-verified": CHAMPION_VERIFIED["max_gain_dbi"][1],
-         "Trust": TRUST["max_gain_dbi"][3]},
-        {"Metric": CHAMPION_VERIFIED["total_efficiency_db"][0],
-         "Surrogate prediction": fmt_pred("total_efficiency_db"),
-         "CST-verified": CHAMPION_VERIFIED["total_efficiency_db"][1],
-         "Trust": TRUST["total_efficiency_db"][3]},
-        {"Metric": CHAMPION_VERIFIED["vswr"][0],
-         "Surrogate prediction": "— (not modelled)",
-         "CST-verified": CHAMPION_VERIFIED["vswr"][1], "Trust": "—"},
-        {"Metric": CHAMPION_VERIFIED["bw"][0],
-         "Surrogate prediction": "— (not modelled)",
-         "CST-verified": CHAMPION_VERIFIED["bw"][1], "Trust": "—"},
+        {"Metric": label,
+         "Surrogate predicts": surr_cell(spec),
+         "CST-verified (truth)": verified,
+         "Trust": trust}
+        for (label, spec, verified, trust) in COMPARISON_ROWS
     ])
+
     def _trust_col_style(col):
         return [
             f"background-color:{TRUST_COLOR[v]};color:white;font-weight:600;"
@@ -493,6 +551,12 @@ _Model source: {source}._
 
     styler = table.style.apply(_trust_col_style, subset=["Trust"])
     st.dataframe(styler, hide_index=True, use_container_width=True)
+
+    st.warning(
+        "The surrogate predicts 11.03 dBi at broadside, but full-wave CST simulation "
+        "measured 10.9 dBi with the main lobe squinted 31° off-axis — a feed phase "
+        "imbalance the surrogate cannot capture. This gap illustrates why full-wave "
+        "verification remains essential, especially for pattern and matching behaviour.")
 
 
 if __name__ == "__main__":

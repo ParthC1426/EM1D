@@ -1,0 +1,8 @@
+[theme]
+# Neutral slate-blue accent so slider value labels read as technical, not alarm
+# red — keeps them from competing with the UNRELIABLE trust badge (#c0392b).
+primaryColor = "#3a7ca5"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f2f4f7"
+textColor = "#1f2933"
+font = "sans serif"
