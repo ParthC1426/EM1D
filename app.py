@@ -9,6 +9,7 @@ predictions are trustworthy (gain/directivity, R^2=0.92) and which are not
 (S11 and resonant frequency, R^2<0, because resonance shifts discontinuously).
 """
 
+import logging
 import pickle
 import warnings
 
@@ -183,27 +184,78 @@ def draw_geometry(params):
 
 
 def draw_uncertainty(preds):
-    """Error-bar plot across the four metrics: gain tight, S11 huge."""
+    """Two-panel uncertainty view across the four metrics.
+
+    Left  : predicted value with its +/- 1 sigma band, in each metric's native units.
+    Right : *relative* uncertainty sigma / |value| on a log scale, so S11's huge
+            relative uncertainty stays visible even when its absolute sigma is small
+            (as at the champion point).
+
+    Hardened: all inputs coerced finite, axis limits pinned to finite margins so
+    autoscaling cannot collapse or throw, sigma annotations offset off the markers
+    and y-tick labels so nothing overlaps. Always returns a fully-built figure.
+    """
     keys = ["max_gain_dbi", "total_efficiency_db", "s11_at_2p45", "s11_min_freq"]
-    labels = [f"{TRUST[k][0]}\n({TRUST[k][1]})" for k in keys]
-    means = [preds[k][0] for k in keys]
-    stds = [preds[k][1] for k in keys]
+    short = [TRUST[k][0] for k in keys]
+    units = [TRUST[k][1] for k in keys]
     colors = [TRUST_COLOR[TRUST[k][3]] for k in keys]
 
-    fig, ax = plt.subplots(figsize=(6.2, 3.4))
+    # Coerce to finite floats so degenerate values can't break autoscaling.
+    means = np.array([float(preds[k][0]) for k in keys], dtype=float)
+    stds = np.array([max(float(preds[k][1]), 0.0) for k in keys], dtype=float)
+    means = np.where(np.isfinite(means), means, 0.0)
+    stds = np.where(np.isfinite(stds), stds, 0.0)
+
     y = np.arange(len(keys))
-    ax.errorbar(means, y, xerr=stds, fmt="o", capsize=6, capthick=2,
-                elinewidth=2.5, markersize=8, ecolor="#888", color="#222")
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(8.4, 3.6))
+
+    # ---- Left: absolute value +/- 1 sigma (native units per metric) ----
+    axL.errorbar(means, y, xerr=stds, fmt="none", capsize=6, capthick=2,
+                 elinewidth=2.5, ecolor="#888", zorder=2)
+    axL.scatter(means, y, c=colors, s=95, zorder=3, edgecolor="#222", linewidth=0.6)
+    axL.set_yticks(y)
+    axL.set_yticklabels([f"{s}\n({u})" for s, u in zip(short, units)], fontsize=8)
+    axL.invert_yaxis()
+
+    lo = float(np.min(means - stds))
+    hi = float(np.max(means + stds))
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+        lo, hi = float(means.min()) - 1.0, float(means.max()) + 1.0
+        if hi <= lo:
+            lo, hi = lo - 1.0, hi + 1.0
+    pad = max((hi - lo) * 0.18, 0.5)
+    axL.set_xlim(lo - pad, hi + pad)
+
+    # sigma annotation below each marker so it never sits on the point/labels.
     for yi, m, s, c in zip(y, means, stds, colors):
-        ax.scatter([m], [yi], color=c, s=80, zorder=3)
-        ax.text(m, yi + 0.18, f"+/-{s:.3g}", ha="center", va="bottom",
-                fontsize=8, color=c)
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels, fontsize=8)
-    ax.invert_yaxis()
-    ax.set_xlabel("Predicted value (native units per metric)")
-    ax.set_title("Prediction uncertainty (+/- 1 sigma) — note how S11 dwarfs gain", fontsize=9)
-    ax.grid(axis="x", alpha=0.3)
+        axL.annotate(f"±{s:.3g}", (m, yi), textcoords="offset points",
+                     xytext=(0, -13), ha="center", va="top", fontsize=7.5, color=c)
+    axL.set_xlabel("Predicted value (native units)")
+    axL.set_title("Absolute prediction  ± 1σ", fontsize=9)
+    axL.grid(axis="x", alpha=0.3)
+
+    # ---- Right: relative uncertainty sigma / |value| (log scale) ----
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = np.where(np.abs(means) > 1e-9, stds / np.abs(means), np.nan)
+    floor = 1e-4  # display floor so log bars for near-zero sigma stay visible
+    rel_plot = np.where(np.isfinite(rel) & (rel > floor), rel, floor)
+    axR.barh(y, rel_plot, color=colors, alpha=0.85, edgecolor="#222", linewidth=0.6)
+    axR.set_xscale("log")
+    axR.set_yticks(y)
+    axR.set_yticklabels([])
+    axR.invert_yaxis()
+    top = max(1.0, float(np.nanmax(rel_plot)) * 3.0)
+    if not np.isfinite(top) or top <= floor:
+        top = 1.0
+    axR.set_xlim(floor, top)
+    for yi, r, rp in zip(y, rel, rel_plot):
+        txt = "n/a" if not np.isfinite(r) else f"{r * 100:.2g}%"
+        axR.annotate(txt, (rp, yi), textcoords="offset points", xytext=(4, 0),
+                     ha="left", va="center", fontsize=7.5, color="#333")
+    axR.set_xlabel("Relative uncertainty  σ / |value|  (log)")
+    axR.set_title("Relative uncertainty (σ / |value|)", fontsize=9)
+    axR.grid(axis="x", alpha=0.3, which="both")
+
     fig.tight_layout()
     return fig
 
@@ -250,10 +302,17 @@ def main():
     st.caption("Forward predictor for a 2.45 GHz 2x2 microstrip patch antenna array "
                "— Gaussian-Process ML surrogate with honest uncertainty.")
 
-    left, right = st.columns([0.35, 0.65], gap="large")
+    # How-to-read banner — visible on first load, before any slider moves.
+    st.info(
+        "**How to read this tool:** gain / directivity is **trustworthy** (R²=0.92); "
+        "**S11 and resonant frequency are NOT** (R²<0) and must be verified in "
+        "full-wave simulation.",
+        icon="🧭")
 
-    # ----------------------------- LEFT: inputs -----------------------------
-    with left:
+    # --------------------- SIDEBAR: geometry inputs -------------------------
+    # Inputs live in the sidebar so the results summary stays at the top of the
+    # page on narrow / mobile screens instead of below all 7 sliders.
+    with st.sidebar:
         st.subheader("Geometry inputs")
         st.markdown("Set the 7 design parameters; predictions update live.")
 
@@ -272,7 +331,6 @@ def main():
                 step=0.1, key=key)
 
         st.caption(f"Model trained on {n_train} full-wave CST simulations.")
-        st.caption(f"Model source: {source}")
 
         # In-range / out-of-range indicator vs training envelope.
         out_of_range = []
@@ -302,59 +360,90 @@ one. **Any S11-critical design must be verified in full-wave simulation.**
 
 Note: the champion design was reached by **manual tuning + CST verification**, not
 by the surrogate.
+
+_Model source: {source}._
 """)
 
-    # -------------------------- RIGHT: predictions --------------------------
-    with right:
-        preds = predict_all(models, scaler, params)
+    # ---------------------- MAIN: predictions -------------------------------
+    preds = predict_all(models, scaler, params)
 
-        st.subheader("Predicted performance")
+    st.subheader("Predicted performance")
 
-        # Four metric cards in a 2x2 grid.
-        card_keys = ["max_gain_dbi", "total_efficiency_db", "s11_at_2p45", "s11_min_freq"]
-        rows = [card_keys[:2], card_keys[2:]]
-        for row in rows:
-            cols = st.columns(2)
-            for col, key in zip(cols, row):
-                label, unit, r2, trust = TRUST[key]
-                mean, std = preds[key]
-                color = TRUST_COLOR[trust]
-                with col:
-                    st.markdown(
-                        f"""
+    # Four metric cards in a 2x2 grid.
+    card_keys = ["max_gain_dbi", "total_efficiency_db", "s11_at_2p45", "s11_min_freq"]
+    rows = [card_keys[:2], card_keys[2:]]
+    for row in rows:
+        cols = st.columns(2)
+        for col, key in zip(cols, row):
+            label, unit, r2, trust = TRUST[key]
+            mean, std = preds[key]
+            color = TRUST_COLOR[trust]
+            with col:
+                if trust == "UNRELIABLE":
+                    # De-emphasise: a hurried reader must not take this at face value.
+                    value_html = (
+                        f'<div style="font-size:1.3rem;font-weight:600;color:#9aa0a6;">'
+                        f'≈ {mean:.2f} ± {std:.2g} {unit}'
+                        f'<span style="font-size:0.7rem;font-weight:600;"> (unverified)'
+                        f'</span></div>')
+                else:
+                    value_html = (
+                        f'<div style="font-size:1.5rem;font-weight:700;">'
+                        f'{mean:.2f} ± {std:.2g} {unit}</div>')
+                st.markdown(
+                    f"""
 <div style="border:1px solid #ddd;border-left:6px solid {color};
      border-radius:8px;padding:12px 14px;margin-bottom:6px;">
   <div style="font-size:0.85rem;color:#666;">{label}</div>
-  <div style="font-size:1.5rem;font-weight:700;">{mean:.2f} ± {std:.2g} {unit}</div>
+  {value_html}
   <div style="display:inline-block;background:{color};color:white;
        border-radius:4px;padding:1px 8px;font-size:0.75rem;font-weight:600;">
        {trust} · R²={r2:+.2f}</div>
-  <div style="font-size:0.75rem;color:#777;margin-top:6px;">{TRUST_CAPTION[trust]}</div>
 </div>
 """, unsafe_allow_html=True)
 
-                    if key == "s11_at_2p45":
-                        passes = mean <= -10.0
-                        if passes:
-                            st.caption(f"−10 dB match threshold: **PASS** "
-                                       f"({mean:.2f} dB ≤ −10 dB)")
-                        else:
-                            st.caption(f"−10 dB match threshold: **FAIL** "
-                                       f"({mean:.2f} dB > −10 dB)")
+                if key == "s11_at_2p45":
+                    passes = mean <= -10.0
+                    verdict = "PASS" if passes else "FAIL"
+                    op = "≤" if passes else ">"
+                    st.caption(f"−10 dB match threshold (on an *unverified* value): "
+                               f"**{verdict}** ({mean:.2f} dB {op} −10 dB)")
 
-                    if trust == "UNRELIABLE":
-                        st.markdown(
-                            f"<div style='color:{TRUST_COLOR['UNRELIABLE']};"
-                            f"font-size:0.8rem;'>⚠ The surrogate cannot reliably "
-                            f"predict this — verify in full-wave simulation.</div>",
-                            unsafe_allow_html=True)
+                if trust == "UNRELIABLE":
+                    st.markdown(
+                        f"<div style='color:{TRUST_COLOR['UNRELIABLE']};"
+                        f"font-size:0.8rem;'>⚠ The surrogate cannot reliably "
+                        f"predict this — verify in full-wave simulation.</div>",
+                        unsafe_allow_html=True)
+                else:
+                    st.caption(TRUST_CAPTION[trust])
 
-        st.markdown("---")
-        st.markdown("#### Uncertainty across metrics")
-        st.pyplot(draw_uncertainty(preds))
+    st.markdown("---")
+    st.markdown("#### Uncertainty across metrics")
+    try:
+        ufig = draw_uncertainty(preds)
+        st.pyplot(ufig)
+        plt.close(ufig)          # avoid stale figure/state reuse across reruns
+        st.caption(
+            "Left: each metric's predicted value with its ±1σ band, in native units. "
+            "Right: relative uncertainty σ/|value| on a log scale, so S11's large "
+            "relative uncertainty stays visible even when its absolute σ looks small.")
+    except Exception:
+        logging.exception("Uncertainty chart generation failed")
+        st.warning("Uncertainty chart could not be drawn for these inputs.")
 
-        st.markdown("#### Live geometry sketch")
-        st.pyplot(draw_geometry(params))
+    st.markdown("#### Live geometry sketch")
+    try:
+        gfig = draw_geometry(params)
+        st.pyplot(gfig)
+        plt.close(gfig)
+        st.caption(
+            "Schematic 2×2 patch array (proportional): four W×L patches on an "
+            "Sx-by-Sy grid inside the ground-plane outline, feed points marked. "
+            "Updates live with the sliders.")
+    except Exception:
+        logging.exception("Geometry sketch generation failed")
+        st.warning("Geometry sketch could not be drawn for these inputs.")
 
     # ------------------ Predicted vs. Verified Champion table ---------------
     st.markdown("---")
@@ -395,7 +484,15 @@ by the surrogate.
          "Surrogate prediction": "— (not modelled)",
          "CST-verified": CHAMPION_VERIFIED["bw"][1], "Trust": "—"},
     ])
-    st.dataframe(table, hide_index=True, use_container_width=True)
+    def _trust_col_style(col):
+        return [
+            f"background-color:{TRUST_COLOR[v]};color:white;font-weight:600;"
+            "text-align:center;" if v in TRUST_COLOR else ""
+            for v in col
+        ]
+
+    styler = table.style.apply(_trust_col_style, subset=["Trust"])
+    st.dataframe(styler, hide_index=True, use_container_width=True)
 
 
 if __name__ == "__main__":
